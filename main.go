@@ -135,10 +135,7 @@ func main() {
 	}
 	defer conn.Close()
 	fmt.Println("connected")
-	// increases volume
-	hexVals := "01304130413043024332313030303137303303070D"
-	x, _ := hex.DecodeString(hexVals)
-	fmt.Println(string(x))
+
 	pkt := ParamCommand{Delimiter: delimiter}
 	// setting this for now...will need to calculate
 	messageLength := new([2]byte)
