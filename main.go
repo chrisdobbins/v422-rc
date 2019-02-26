@@ -1,65 +1,131 @@
 package main
 
 import (
+	"bufio"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 )
 
-const delimiter = "0D"
-const soh = "01"
-const stx = "02"
-const etx = "03"
-const monitorID = "41"
-const sender = "30"
-const reserved = "30"
+const delimiter = 0x0D
+const soh = 0x01
+const stx = 0x02
+const etx = 0x03
+const monitorID = 0x41
+const sender = 0x30
+const reserved = 0x30
 
-type Packet struct {
-	Header    // 7 bytes
-	Message   // 6-10 bytes
-	CheckCode // xor every bit in message except soh
-	Delimiter
+var nullMessage struct {
+	message     Message
+	commandCode [2]byte
 }
 
-type Header struct {
-	Start         string
-	Reserved      string
-	MonitorID     string
-	Sender        string
-	MessageType   string
-	MessageLength string
+type ReplyType struct {
+	ASCIIKey string
+	Value    string
 }
 
-type Message struct {
-	Start      string
-	OpCodePage string
-	OpCode     string
-	End        string
-}
+var types = map[byte]ReplyType{0x41: ReplyType{"A", "Command"},
+	0x42: ReplyType{"B", "Command reply"},
+	0x43: ReplyType{"C", "Get current parameter from a monitor"},
+	0x44: ReplyType{"D", "Get parameter reply"},
+	0x45: ReplyType{"E", "Set parameter"},
+	0x46: ReplyType{"F", "Set parameter reply"}}
 
-type SetMessage struct {
+// possible result values in bytes 2-3 in get param reply
+const successfulStatus = 0x00
+const errOperationNotSupported = 0x01
+
+type ParamReply struct {
+	Header
 	Message
-	Parameter string
+	OPCode
+	OPCodePage
+	Type  [2]byte
+	Value [4]byte // current value or requested value, depending on what orig msg was
 }
 
-type CheckCode string
-type Delimiter string
+type SaveMessage struct {
+	Message
+	CommandCode [2]byte
+}
 
-func genCheckCode(packet Packet) Packet {
+// ParamCommand represents the entire packet sent to the monitor when getting or setting a param
+type ParamCommand struct {
+	Header
+	Message   SetParamMessage
+	CheckCode byte // xor every bit in message except soh
+	Delimiter byte
+}
+
+// Header represents the first 7 bytes of the packet sent to the monitor
+type Header struct {
+	Start         byte
+	Reserved      byte
+	Destination   byte
+	Source        byte
+	MessageType   byte
+	MessageLength [2]byte
+}
+
+// Message represents the data being sent to the monitor
+type Message struct {
+	Start byte
+	End   byte
+}
+
+type SetParamMessage struct {
+	Message
+	OPCode
+	OPCodePage
+	SetValue [4]byte
+}
+
+type OPCode [2]byte
+type OPCodePage [2]byte
+
+// SetValueMessage represents the message sent when setting a parameter
+// TODO: figure out better abstraction
+type SetValueMessage struct {
+	Message
+	SetValue []byte
+}
+
+// Send writes the completed packet to the provided connection
+// The packet must have this order in the byte array written to the connection:
+// Header (7 bytes), Message (6-18[?] bytes), Check Code (1 byte), Delimiter (1 byte)
+func (p ParamCommand) Send(conn net.Conn) {
+	// order matters
+	out := []byte{p.Header.Start, p.Header.Reserved, p.Header.Destination, p.Header.Source, p.Header.MessageType}
+	out = append(out, p.Header.MessageLength[:]...)
+	out = append(out, p.Message.Start)
+	out = append(out, p.Message.OPCodePage[:]...)
+	out = append(out, p.Message.OPCode[:]...)
+	out = append(out, p.Message.End, p.CheckCode, p.Delimiter)
+	conn.Write(out)
+}
+
+func (p *ParamCommand) genCheckCode() {
 	// packet.Header (except for SOH), packet.Message
-	stuffToDecode := []int{0x30, 0x41, 0x30, 0x41, 0x30, 0x43, 0x02, 0x43, 0x32, 0x31, 0x30, 0x30, 0x30, 0x31, 0x37, 0x30, 0x33, 0x03}
-	var result *int
-	for _, num := range stuffToDecode {
+	// XOR operation. order in slice doesn't matter
+	checkCodeVals := []byte{p.Message.Start, p.Message.End, p.Header.Destination, p.Header.MessageType, p.Header.Reserved, p.Header.Source}
+	checkCodeVals = append(checkCodeVals, p.Header.MessageLength[:]...)
+	checkCodeVals = append(checkCodeVals, p.Message.OPCode[:]...)
+	checkCodeVals = append(checkCodeVals, p.Message.OPCodePage[:]...)
+	// TODO: add set value stuff here later...
+
+	var result *byte
+	for _, num := range checkCodeVals {
 		if result == nil {
-			result = new(int)
+			result = new(byte)
 			*result = num
 			continue
 		}
 		*result ^= num
 	}
 	fmt.Println(*result)
+	p.CheckCode = *result
 }
 
 func main() {
@@ -70,32 +136,61 @@ func main() {
 	defer conn.Close()
 	fmt.Println("connected")
 	// increases volume
-	hexVals := "01 30 41 30 41 30 43 02 43 32 31 30 30 30 31 37 30 33 03 07 0D"
-	pkt := Packet{
-		Header{
-			Start:         soh,
-			Reserved:      reserved,
-			MonitorID:     monitorID,
-			Sender:        sender,
-			MessageType:   "41",   // corresp. to ascii 'A', which indic a message of type "Command"
-			MessageLength: "3036", // "30" -> '0', "36" -> '6'
-		},
-		Message{
-			Start:      stx,
-			OpCodePage: "4332", // corresp. to 'C2'
-			OpCode:     "3136", // '16'
-			End:        etx,
-		},
-		CheckCode: genCheckCode(),
-		Delimiter: delimiter,
+	hexVals := "01304130413043024332313030303137303303070D"
+	x, _ := hex.DecodeString(hexVals)
+	fmt.Println(string(x))
+	pkt := ParamCommand{Delimiter: delimiter}
+	// setting this for now...will need to calculate
+	messageLength := new([2]byte)
+	hex.Decode(messageLength[:], []byte("3036"))
+	pkt.Header = Header{
+		Start:         soh,
+		Reserved:      reserved,
+		Destination:   monitorID,
+		Source:        sender,
+		MessageType:   0x41,
+		MessageLength: *messageLength,
 	}
-	out := []byte{}
-	for _, val := range strings.Split(hexVals, " ") {
-		decVal, err := hex.DecodeString(val)
-		if err != nil {
-			log.Fatal(err)
-		}
-		out = append(out, decVal...)
+
+	opCode := new([2]byte)
+	opCodePage := new([2]byte)
+	hex.Decode(opCodePage[:], []byte("4332"))
+	hex.Decode(opCode[:], []byte("3136"))
+	// get serial number
+	pkt.Message = SetParamMessage{
+		OPCodePage: *opCodePage, // corresp. to 'C2'
+		OPCode:     *opCode,     // '16'
 	}
-	conn.Write(out)
+	pkt.Message.Start, pkt.Message.End = stx, etx
+
+	pkt.genCheckCode()
+	fmt.Println(fmt.Sprintf("%#+v", pkt))
+
+	pkt.Send(conn)
+
+	status, err := bufio.NewReader(conn).ReadString(delimiter)
+	if err != nil {
+		log.Fatal(err)
+	}
+	reply := ParamReply{}
+	reply.MessageLength = *new([2]byte)
+	reply.OPCode = OPCode(*new([2]byte))
+	reply.OPCodePage = OPCodePage(*new([2]byte))
+	replyHeader := status[:7]
+	replyType := types[replyHeader[4]].ASCIIKey
+	fmt.Println("replyType: ", replyType)
+	encodedMsgLength := replyHeader[4:6]
+	s, _ := hex.DecodeString(string(encodedMsgLength))
+	fmt.Println("encodedMsgLength: ", s)
+
+	ba, err := hex.DecodeString(string(status[12:32]))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(ba)
+	for _, char := range ba {
+		fmt.Print(string(char))
+	}
+	fmt.Println()
+	fmt.Printf("%q\n", status[12:32])
 }
