@@ -2,10 +2,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
+
+	"github.com/chrisdobbins/v422rc/ir"
 )
 
 const delimiter = 0x0D
@@ -26,12 +27,12 @@ type ReplyType struct {
 	Value    string
 }
 
-var types = map[byte]ReplyType{0x41: ReplyType{"A", "Command"},
-	0x42: ReplyType{"B", "Command reply"},
-	0x43: ReplyType{"C", "Get current parameter from a monitor"},
-	0x44: ReplyType{"D", "Get parameter reply"},
-	0x45: ReplyType{"E", "Set parameter"},
-	0x46: ReplyType{"F", "Set parameter reply"}}
+var types = map[string]byte{"A": 0x41, // "Command"
+	"B": 0x42, // "Command reply"
+	"C": 0x43, // "Get current parameter from a monitor"
+	"D": 0x44, //"Get parameter reply"
+	"E": 0x45, // "Set parameter"
+	"F": 0x46} // "Set parameter reply
 
 // possible result values in bytes 2-3 in get param reply
 const successfulStatus = 0x00
@@ -43,7 +44,7 @@ type ParamReply struct {
 	OPCode
 	OPCodePage
 	Type  [2]byte
-	Value [4]byte // current value or requested value, depending on what orig msg was
+	Value [6]byte // current value or requested value, depending on what orig msg was
 }
 
 type SaveMessage struct {
@@ -76,21 +77,15 @@ type Message struct {
 }
 
 type SetParamMessage struct {
-	Message
+	Start byte
+	End   byte
 	OPCode
 	OPCodePage
-	SetValue [4]byte
+	SetValue [6]byte
 }
 
 type OPCode [2]byte
 type OPCodePage [2]byte
-
-// SetValueMessage represents the message sent when setting a parameter
-// TODO: figure out better abstraction
-type SetValueMessage struct {
-	Message
-	SetValue []byte
-}
 
 // Send writes the completed packet to the provided connection
 // The packet must have this order in the byte array written to the connection:
@@ -102,6 +97,7 @@ func (p ParamCommand) Send(conn net.Conn) {
 	out = append(out, p.Message.Start)
 	out = append(out, p.Message.OPCodePage[:]...)
 	out = append(out, p.Message.OPCode[:]...)
+	out = append(out, p.Message.SetValue[:]...)
 	out = append(out, p.Message.End, p.CheckCode, p.Delimiter)
 	conn.Write(out)
 }
@@ -113,7 +109,7 @@ func (p *ParamCommand) genCheckCode() {
 	checkCodeVals = append(checkCodeVals, p.Header.MessageLength[:]...)
 	checkCodeVals = append(checkCodeVals, p.Message.OPCode[:]...)
 	checkCodeVals = append(checkCodeVals, p.Message.OPCodePage[:]...)
-	// TODO: add set value stuff here later...
+	checkCodeVals = append(checkCodeVals, p.Message.SetValue[:]...)
 
 	var result *byte
 	for _, num := range checkCodeVals {
@@ -124,8 +120,23 @@ func (p *ParamCommand) genCheckCode() {
 		}
 		*result ^= num
 	}
-	fmt.Println(*result)
 	p.CheckCode = *result
+}
+
+var commands = map[string]func() []byte{"toggle power": ir.TogglePower,
+	"to Displayport": ir.ToDisplayport}
+
+func (p *ParamCommand) Set(_ string) {
+	cmd := commands["to Displayport"]() // commands["toggle power"]()
+	p.Header.MessageType = types["A"]
+	copy(p.Message.OPCodePage[:], cmd[:2])
+	copy(p.Message.OPCode[:], cmd[2:4])
+	copy(p.Message.SetValue[:], cmd[4:])
+	formattedMessageLength := fmt.Sprintf("%02X", 2+len(cmd))
+	fmt.Printf("%+v\n", p)
+	for idx, ch := range formattedMessageLength {
+		p.Header.MessageLength[idx] = byte(ch)
+	}
 }
 
 func main() {
@@ -137,57 +148,41 @@ func main() {
 	fmt.Println("connected")
 
 	pkt := ParamCommand{Delimiter: delimiter}
-	// setting this for now...will need to calculate
-	messageLength := new([2]byte)
-	hex.Decode(messageLength[:], []byte("3036"))
-	pkt.Header = Header{
-		Start:         soh,
-		Reserved:      reserved,
-		Destination:   monitorID,
-		Source:        sender,
-		MessageType:   0x41,
-		MessageLength: *messageLength,
-	}
 
-	opCode := new([2]byte)
-	opCodePage := new([2]byte)
-	hex.Decode(opCodePage[:], []byte("4332"))
-	hex.Decode(opCode[:], []byte("3136"))
-	// get serial number
-	pkt.Message = SetParamMessage{
-		OPCodePage: *opCodePage, // corresp. to 'C2'
-		OPCode:     *opCode,     // '16'
-	}
+	pkt.Header.Start = soh
+	pkt.Header.Reserved = reserved
 	pkt.Message.Start, pkt.Message.End = stx, etx
+	pkt.Destination = monitorID
+	pkt.Source = sender
 
+	pkt.Set("tempVal")
 	pkt.genCheckCode()
 	fmt.Println(fmt.Sprintf("%#+v", pkt))
-
 	pkt.Send(conn)
 
 	status, err := bufio.NewReader(conn).ReadString(delimiter)
 	if err != nil {
 		log.Fatal(err)
 	}
-	reply := ParamReply{}
-	reply.MessageLength = *new([2]byte)
-	reply.OPCode = OPCode(*new([2]byte))
-	reply.OPCodePage = OPCodePage(*new([2]byte))
-	replyHeader := status[:7]
-	replyType := types[replyHeader[4]].ASCIIKey
-	fmt.Println("replyType: ", replyType)
-	encodedMsgLength := replyHeader[4:6]
-	s, _ := hex.DecodeString(string(encodedMsgLength))
-	fmt.Println("encodedMsgLength: ", s)
+	fmt.Println(status)
+	// reply := ParamReply{}
+	// reply.MessageLength = *new([2]byte)
+	// reply.OPCode = OPCode(*new([2]byte))
+	// reply.OPCodePage = OPCodePage(*new([2]byte))
+	// replyHeader := status[:7]
+	// replyType := types[replyHeader[4]].ASCIIKey
+	// fmt.Println("replyType: ", replyType)
+	// encodedMsgLength := replyHeader[4:6]
+	// s, _ := hex.DecodeString(string(encodedMsgLength))
+	// fmt.Println("encodedMsgLength: ", s)
 
-	ba, err := hex.DecodeString(string(status[12:32]))
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(ba)
-	for _, char := range ba {
-		fmt.Print(string(char))
-	}
-	fmt.Println()
-	fmt.Printf("%q\n", status[12:32])
+	// ba, err := hex.DecodeString(string(status[12:32]))
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// fmt.Println(ba)
+	// for _, char := range ba {
+	// 	fmt.Print(string(char))
+	// }
+	// fmt.Println()
 }

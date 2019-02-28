@@ -23,3 +23,10 @@ func TogglePower() []byte {
 	data = append(data, repeat...)
 	return data
 }
+
+func ToDisplayport() []byte {
+	data := append([]byte{}, command[:]...)
+	data = append(data, changeInputToDisplayport[:]...)
+	data = append(data, repeat...)
+	return data
+}
